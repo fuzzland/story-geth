@@ -19,11 +19,16 @@ package bundle
 import (
 	"context"
 	"fmt"
-	"github.com/ethereum/go-ethereum/core"
-	"github.com/ethereum/go-ethereum/core/vm"
 	"net"
+	"slices"
+	"sort"
 	"sync"
 	"time"
+
+	"github.com/holiman/uint256"
+
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/vm"
 
 	"github.com/ethereum/go-ethereum/rpc"
 
@@ -46,33 +51,43 @@ type Backend interface {
 // Service implements the bundle service gRPC server
 type Service struct {
 	pb.UnimplementedBundleServiceServer
-	server           *grpc.Server
-	bundles          []Bundle
-	validatedBundles []Bundle
-	mu               sync.RWMutex
-	quit             chan struct{}
+	server *grpc.Server
 
-	node       *node.Node
-	backend    Backend
-	blockchain *core.BlockChain
+	mu   sync.RWMutex
+	quit chan struct{}
+
+	bundles       []*Bundle
+	sortedBundles []*Bundle
+
+	node    *node.Node
+	backend Backend
+	chain   *core.BlockChain
+	signer  types.Signer
 }
 
 type Bundle struct {
 	Hash         common.Hash
+	Senders      []common.Address
 	Transactions []types.Transaction
 	MaxTimestamp uint64
 	MinTimestamp uint64
 }
 
 // NewService creates a new bundle service
-func NewService(node *node.Node, backend Backend) *Service {
+func NewService(node *node.Node, backend Backend, chain *core.BlockChain) *Service {
+
 	return &Service{
-		server:           grpc.NewServer(),
-		bundles:          make([]Bundle, 0),
-		validatedBundles: make([]Bundle, 0),
-		node:             node,
-		backend:          backend,
-		quit:             make(chan struct{}),
+		server: grpc.NewServer(),
+
+		quit: make(chan struct{}),
+
+		bundles:       make([]*Bundle, 0),
+		sortedBundles: make([]*Bundle, 0),
+
+		node:    node,
+		backend: backend,
+		chain:   chain,
+		signer:  types.LatestSignerForChainID(chain.Config().ChainID),
 	}
 }
 
@@ -118,7 +133,7 @@ func (s *Service) Stop() error {
 }
 
 // AddBundle adds a new bundle to the service
-func (s *Service) AddBundle(bundle Bundle) error {
+func (s *Service) AddBundle(bundle *Bundle) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.bundles = append(s.bundles, bundle)
@@ -140,6 +155,12 @@ func (s *Service) simulationLoop() {
 	}
 }
 
+type bundleInfo struct {
+	bundle         Bundle
+	coinbasePayout uint256.Int
+	primaryPayout  uint256.Int
+}
+
 // processBundles processes all pending bundles
 func (s *Service) processBundles() {
 	s.mu.Lock()
@@ -152,8 +173,8 @@ func (s *Service) processBundles() {
 
 	currentTime := uint64(time.Now().Unix())
 
-	var validBundles []Bundle
-	var remainingBundles []Bundle
+	var remainingBundles []*Bundle
+	var validBundles []bundleInfo
 
 	for _, bundle := range s.bundles {
 		// Check timestamp constraints
@@ -164,7 +185,7 @@ func (s *Service) processBundles() {
 
 		// Simulate bundle
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := s.SimulateBundle(ctx, &bundle)
+		coinbasePayout, primaryPayout, err := s.SimulateBundle(ctx, bundle.Transactions, &s.node.Config().RelayServer.PayoutAddress)
 		cancel()
 
 		if err != nil {
@@ -173,19 +194,52 @@ func (s *Service) processBundles() {
 		}
 
 		// If all checks pass, add to valid bundles
-		validBundles = append(validBundles, bundle)
+		validBundles = append(validBundles, bundleInfo{
+			bundle:         *bundle,
+			coinbasePayout: *coinbasePayout,
+			primaryPayout:  *primaryPayout,
+		})
 		remainingBundles = append(remainingBundles, bundle)
 	}
 
+	// Sorted bundles by primary payout and then coinbase payout, DESCENDING
+	sort.Slice(validBundles, func(i, j int) bool {
+		if validBundles[i].primaryPayout.Cmp(&validBundles[j].primaryPayout) == 0 {
+			return validBundles[i].coinbasePayout.Cmp(&validBundles[j].coinbasePayout) > 0
+		}
+
+		return validBundles[i].primaryPayout.Cmp(&validBundles[j].primaryPayout) > 0
+	})
+
+	var sortedBundles []*Bundle
+	var touchedSenders []common.Address
+
+	for _, bundle := range validBundles {
+		var accountConflict bool
+		for _, sender := range bundle.bundle.Senders {
+			if slices.Contains(touchedSenders, sender) {
+				accountConflict = true
+				break
+			}
+		}
+
+		if accountConflict {
+			continue
+		}
+
+		sortedBundles = append(sortedBundles, &bundle.bundle)
+		touchedSenders = append(touchedSenders, bundle.bundle.Senders...)
+	}
+
 	s.bundles = remainingBundles
-	s.validatedBundles = validBundles
+	s.sortedBundles = sortedBundles
 }
 
 // GetValidatedBundles returns the currently validated bundles
-func (s *Service) GetValidatedBundles() []Bundle {
+func (s *Service) GetValidatedBundles() []*Bundle {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return append([]Bundle{}, s.validatedBundles...)
+	return s.sortedBundles
 }
 
 // GetBundles implements the GetBundles RPC method
@@ -194,8 +248,8 @@ func (s *Service) GetBundles(ctx context.Context, req *pb.GetBundlesRequest) (*p
 	defer s.mu.RUnlock()
 
 	// Convert validated bundles to protobuf format
-	pbBundles := make([]*pb.Bundle, len(s.validatedBundles))
-	for i, bundle := range s.validatedBundles {
+	pbBundles := make([]*pb.Bundle, len(s.sortedBundles))
+	for i, bundle := range s.sortedBundles {
 		pbTxs := make([][]byte, len(bundle.Transactions))
 		for j, tx := range bundle.Transactions {
 			txBytes, err := tx.MarshalBinary()
@@ -215,29 +269,48 @@ func (s *Service) GetBundles(ctx context.Context, req *pb.GetBundlesRequest) (*p
 	}, nil
 }
 
-func (s *Service) SimulateBundle(ctx context.Context, bundle *Bundle) error {
+func (s *Service) SimulateBundle(ctx context.Context, txs []types.Transaction, primaryBeneficiary *common.Address) (*uint256.Int, *uint256.Int, error) {
 	state, header, err := s.backend.StateAndHeaderByNumber(ctx, rpc.PendingBlockNumber)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
-	for _, tx := range bundle.Transactions {
-		msg, err := core.TransactionToMessage(&tx, types.LatestSignerForChainID(s.blockchain.Config().ChainID), header.BaseFee)
+	vmConfig := vm.Config{}
+	blockContext := core.NewEVMBlockContext(header, s.chain, nil)
+	gp := new(core.GasPool).AddGas(header.GasLimit)
+
+	primaryBalance := uint256.NewInt(0)
+	coinbaseBalance := state.GetBalance(header.Coinbase)
+
+	if primaryBalance != nil {
+		primaryBalance = state.GetBalance(*primaryBeneficiary)
+	}
+
+	for _, tx := range txs {
+		msg, err := core.TransactionToMessage(&tx, s.signer, header.BaseFee)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 
-		vmConfig := vm.Config{}
-		blockContext := core.NewEVMBlockContext(header, s.blockchain, nil)
 		evm := s.backend.GetEVM(ctx, msg, state, header, &vmConfig, &blockContext)
-
-		snapshot := state.Snapshot()
-		_, err = core.ApplyMessage(evm, msg, new(core.GasPool).AddGas(msg.GasLimit))
+		_, err = core.ApplyMessage(evm, msg, gp)
 		if err != nil {
-			state.RevertToSnapshot(snapshot)
-			return err
+			return nil, nil, err
 		}
 	}
 
-	return nil
+	coinbasePayout, overflow := uint256.NewInt(0).SubOverflow(state.GetBalance(header.Coinbase), coinbaseBalance)
+	if overflow {
+		return nil, nil, fmt.Errorf("coinbase payout overflow")
+	}
+
+	primaryPayout := uint256.NewInt(0)
+	if primaryBalance != nil {
+		primaryPayout, overflow = uint256.NewInt(0).SubOverflow(primaryBalance, coinbasePayout)
+		if overflow {
+			return nil, nil, fmt.Errorf("primary payout overflow")
+		}
+	}
+
+	return coinbasePayout, primaryPayout, nil
 }

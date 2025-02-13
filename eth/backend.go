@@ -335,7 +335,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		return nil, err
 	}
 
-	bundleService := bundle.NewService(stack, eth.APIBackend)
+	bundleService := bundle.NewService(stack, eth.APIBackend, eth.blockchain)
 	eth.APIBackend.bundleService = bundleService
 
 	// Start the RPC service

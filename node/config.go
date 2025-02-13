@@ -75,6 +75,9 @@ type Config struct {
 
 		// Port is the TCP port number on which to start the relay server.
 		Port int `toml:",omitempty"`
+
+		// PayoutAddress is the address that will receive the payout.
+		PayoutAddress common.Address `toml:",omitempty"`
 	} `toml:",omitempty"`
 
 	// KeyStoreDir is the file system folder that contains private keys. The directory can

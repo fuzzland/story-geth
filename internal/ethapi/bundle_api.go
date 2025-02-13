@@ -4,6 +4,7 @@ package ethapi
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/ethereum/go-ethereum/bundle"
@@ -15,12 +16,13 @@ import (
 
 // BundleAPI offers an API for accepting bundled transactions
 type BundleAPI struct {
-	b Backend
+	b      Backend
+	signer types.Signer
 }
 
 // NewBundleAPI creates a new Tx Bundle API instance.
 func NewBundleAPI(b Backend) *BundleAPI {
-	return &BundleAPI{b}
+	return &BundleAPI{b: b, signer: types.LatestSignerForChainID(b.ChainConfig().ChainID)}
 }
 
 // CallBundleArgs represents the arguments for a call.
@@ -43,16 +45,30 @@ func (a *SendBundleArgs) Hash() common.Hash {
 
 func (s *BundleAPI) SendBundle(ctx context.Context, args SendBundleArgs) (common.Hash, error) {
 	txs := make([]types.Transaction, len(args.Txs))
+	senders := make([]common.Address, 0, len(args.Txs))
+
 	for i, txBytes := range args.Txs {
 		tx := new(types.Transaction)
 		if err := tx.UnmarshalBinary(txBytes); err != nil {
 			return common.Hash{}, fmt.Errorf("transaction %d: %v", i, err)
 		}
 		txs[i] = *tx
+
+		sender, err := types.Sender(s.signer, tx)
+		if err != nil {
+			return common.Hash{}, fmt.Errorf("transaction %d: invalid signature %v", i, err)
+		}
+
+		if slices.Contains(senders, sender) {
+			continue
+		}
+
+		senders = append(senders, sender)
 	}
 
 	bundle := bundle.Bundle{
 		Hash:         args.Hash(),
+		Senders:      senders,
 		Transactions: txs,
 		MinTimestamp: 0,
 		MaxTimestamp: ^uint64(0),
@@ -61,6 +77,7 @@ func (s *BundleAPI) SendBundle(ctx context.Context, args SendBundleArgs) (common
 	if args.MinTimestamp != nil {
 		bundle.MinTimestamp = *args.MinTimestamp
 	}
+
 	if args.MaxTimestamp != nil {
 		bundle.MaxTimestamp = uint64(time.Now().Unix() + 300) // 5 minutes = 300 seconds
 	}
@@ -69,11 +86,12 @@ func (s *BundleAPI) SendBundle(ctx context.Context, args SendBundleArgs) (common
 
 	ctx, _ = context.WithTimeout(ctx, 10*time.Second)
 
-	if err := bundleService.SimulateBundle(ctx, &bundle); err != nil {
+	_, _, err := bundleService.SimulateBundle(ctx, bundle.Transactions, nil)
+	if err != nil {
 		return common.Hash{}, err
 	}
 
-	if err := s.b.BundleService().AddBundle(bundle); err != nil {
+	if err := s.b.BundleService().AddBundle(&bundle); err != nil {
 		return common.Hash{}, err
 	}
 
