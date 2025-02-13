@@ -60,7 +60,6 @@ type Service struct {
 type Bundle struct {
 	Hash         common.Hash
 	Transactions []types.Transaction
-	BlockNumber  rpc.BlockNumber
 	MaxTimestamp uint64
 	MinTimestamp uint64
 }
@@ -151,19 +150,12 @@ func (s *Service) processBundles() {
 		return
 	}
 
-	currentBlockNum := currentBlock.Number.Uint64()
 	currentTime := uint64(time.Now().Unix())
 
 	var validBundles []Bundle
 	var remainingBundles []Bundle
 
 	for _, bundle := range s.bundles {
-		//// Check block number constraints
-		if bundle.BlockNumber < rpc.BlockNumber(currentBlockNum) {
-			log.Debug("Dropping expired bundle", "hash", bundle.Hash)
-			continue
-		}
-
 		// Check timestamp constraints
 		if bundle.MinTimestamp > currentTime || bundle.MaxTimestamp < currentTime {
 			log.Debug("Dropping out-of-time bundle", "hash", bundle.Hash)
@@ -224,7 +216,7 @@ func (s *Service) GetBundles(ctx context.Context, req *pb.GetBundlesRequest) (*p
 }
 
 func (s *Service) SimulateBundle(ctx context.Context, bundle *Bundle) error {
-	state, header, err := s.backend.StateAndHeaderByNumber(ctx, bundle.BlockNumber)
+	state, header, err := s.backend.StateAndHeaderByNumber(ctx, rpc.PendingBlockNumber)
 	if err != nil {
 		return err
 	}

@@ -4,12 +4,12 @@ package ethapi
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/ethereum/go-ethereum/bundle"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/rpc"
 	"golang.org/x/crypto/sha3"
 )
 
@@ -25,10 +25,9 @@ func NewBundleAPI(b Backend) *BundleAPI {
 
 // CallBundleArgs represents the arguments for a call.
 type SendBundleArgs struct {
-	Txs          []hexutil.Bytes  `json:"txs"`
-	BlockNumber  *rpc.BlockNumber `json:"blockNumber,omitempty"`
-	MinTimestamp *uint64          `json:"minTimestamp,omitempty"`
-	MaxTimestamp *uint64          `json:"maxTimestamp,omitempty"`
+	Txs          []hexutil.Bytes `json:"txs"`
+	MinTimestamp *uint64         `json:"minTimestamp,omitempty"`
+	MaxTimestamp *uint64         `json:"maxTimestamp,omitempty"`
 }
 
 func (a *SendBundleArgs) Hash() common.Hash {
@@ -52,15 +51,9 @@ func (s *BundleAPI) SendBundle(ctx context.Context, args SendBundleArgs) (common
 		txs[i] = *tx
 	}
 
-	blockNumber := rpc.LatestBlockNumber
-	if args.BlockNumber != nil {
-		blockNumber = *args.BlockNumber
-	}
-
 	bundle := bundle.Bundle{
 		Hash:         args.Hash(),
 		Transactions: txs,
-		BlockNumber:  blockNumber,
 		MinTimestamp: 0,
 		MaxTimestamp: ^uint64(0),
 	}
@@ -69,7 +62,15 @@ func (s *BundleAPI) SendBundle(ctx context.Context, args SendBundleArgs) (common
 		bundle.MinTimestamp = *args.MinTimestamp
 	}
 	if args.MaxTimestamp != nil {
-		bundle.MaxTimestamp = *args.MaxTimestamp
+		bundle.MaxTimestamp = uint64(time.Now().Unix() + 300) // 5 minutes = 300 seconds
+	}
+
+	bundleService := s.b.BundleService()
+
+	ctx, _ = context.WithTimeout(ctx, 10*time.Second)
+
+	if err := bundleService.SimulateBundle(ctx, &bundle); err != nil {
+		return common.Hash{}, err
 	}
 
 	if err := s.b.BundleService().AddBundle(bundle); err != nil {
