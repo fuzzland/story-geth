@@ -65,7 +65,8 @@ type BlockChain interface {
 // They exit the pool when they are included in the blockchain or evicted due to
 // resource constraints.
 type TxPool struct {
-	subpools []SubPool // List of subpools for specialized transaction handling
+	subpools   []SubPool // List of subpools for specialized transaction handling
+	bundlePool *BundlePool
 
 	reservations map[common.Address]SubPool // Map with the account to pool reservations
 	reserveLock  sync.Mutex                 // Lock protecting the account reservations
@@ -79,7 +80,7 @@ type TxPool struct {
 
 // New creates a new transaction pool to gather, sort and filter inbound
 // transactions from the network.
-func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
+func New(gasTip uint64, chain BlockChain, subpools []SubPool, bundlePool *BundlePool) (*TxPool, error) {
 	// Retrieve the current head so that all subpools and this main coordinator
 	// pool will have the same starting state, even if the chain moves forward
 	// during initialization.
@@ -87,6 +88,7 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 
 	pool := &TxPool{
 		subpools:     subpools,
+		bundlePool:   bundlePool,
 		reservations: make(map[common.Address]SubPool),
 		quit:         make(chan chan error),
 		term:         make(chan struct{}),
@@ -102,6 +104,13 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 	}
 	go pool.loop(head, chain)
 	return pool, nil
+}
+
+func (p *TxPool) PendingBundles(filter PendingFilter) [][]*types.Transaction {
+	if p.bundlePool == nil {
+		return nil
+	}
+	return (*p.bundlePool).PendingBundles(filter)
 }
 
 // reserver is a method to create an address reservation callback to exclusively

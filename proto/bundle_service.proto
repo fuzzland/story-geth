@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package bundle;
+
+option go_package = "github.com/ethereum/go-ethereum/proto/bundle";
+
+// Bundle represents a group of transactions
+message Bundle {
+  repeated bytes transactions = 1;  // Each transaction is serialized bytes
+  uint64 deadline = 2;
+}
+
+// GetBundlesRequest is empty since we just want to fetch all available bundles
+message GetBundlesRequest {
+}
+
+// GetBundlesResponse contains a list of bundles
+message GetBundlesResponse {
+  repeated Bundle bundles = 1;
+}
+
+// BundleService provides methods for retrieving transaction bundles
+service BundleService {
+  // GetBundles returns available transaction bundles
+  rpc GetBundles(GetBundlesRequest) returns (GetBundlesResponse) {}
+} 

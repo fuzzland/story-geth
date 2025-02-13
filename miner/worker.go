@@ -220,6 +220,19 @@ func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase
 	}, nil
 }
 
+func (miner *Miner) commitBundle(env *environment, txs []*types.Transaction) error {
+	receipts, err := miner.applyBundle(env, txs)
+	if err != nil {
+		return err
+	}
+	env.txs = append(env.txs, txs...)
+	for _, receipt := range receipts {
+		env.receipts = append(env.receipts, &receipt)
+		env.tcount++
+	}
+	return nil
+}
+
 func (miner *Miner) commitTransaction(env *environment, tx *types.Transaction) error {
 	if tx.Type() == types.BlobTxType {
 		return miner.commitBlobTransaction(env, tx)
@@ -271,6 +284,82 @@ func (miner *Miner) applyTransaction(env *environment, tx *types.Transaction) (*
 		env.gasPool.SetGas(gp)
 	}
 	return receipt, err
+}
+
+func (miner *Miner) applyBundle(env *environment, txs []*types.Transaction) ([]types.Receipt, error) {
+	var (
+		snap     = env.state.Snapshot()
+		gp       = env.gasPool.Gas()
+		receipts = make([]types.Receipt, 0, len(txs))
+	)
+	for _, tx := range txs {
+		receipt, err := core.ApplyTransaction(miner.chainConfig, miner.chain, &env.coinbase, env.gasPool, env.state, env.header, tx, &env.header.GasUsed, vm.Config{})
+		if err != nil {
+			env.state.RevertToSnapshot(snap)
+			env.gasPool.SetGas(gp)
+			return nil, err
+		}
+
+		if receipt.Status != types.ReceiptStatusSuccessful {
+			return nil, errors.New("bundle transaction failed")
+		}
+		receipts = append(receipts, *receipt)
+	}
+	return receipts, nil
+}
+
+func (miner *Miner) commitBundleTxs(env *environment, pendingBundleTxs [][]*types.Transaction, interrupt *atomic.Int32) error {
+	for _, bundleTxs := range pendingBundleTxs {
+		if interrupt != nil {
+			if signal := interrupt.Load(); signal != commitInterruptNone {
+				return signalToErr(signal)
+			}
+		}
+
+		if env.gasPool.Gas() < params.TxGas {
+			log.Trace("Not enough gas for further transactions", "have", env.gasPool, "want", params.TxGas)
+			return nil
+		}
+
+		var (
+			gas     uint64
+			blobGas uint64
+			txs     []*types.Transaction = make([]*types.Transaction, 0, len(bundleTxs))
+			failed  bool
+		)
+		for _, tx := range bundleTxs {
+			gas += tx.Gas()
+			blobGas += tx.BlobGas()
+			// Check whether the tx is replay protected. If we're not in the EIP155 hf
+			// phase, start ignoring the sender until we do.
+			if tx.Protected() && !miner.chainConfig.IsEIP155(env.header.Number) {
+				log.Trace("Ignoring replay protected transaction", "hash", tx.Hash(), "eip155", miner.chainConfig.EIP155Block)
+				failed = true
+				break
+			}
+			txs = append(txs, tx)
+			env.state.SetTxContext(tx.Hash(), env.tcount)
+		}
+
+		if failed {
+			continue
+		}
+
+		if env.gasPool.Gas() < gas {
+			log.Trace("Not enough gas left for transaction", "left", env.gasPool.Gas(), "needed", gas)
+			continue
+		}
+		if left := uint64(params.MaxBlobGasPerBlock - env.blobs*params.BlobTxBlobGasPerBlob); left < blobGas {
+			log.Trace("Not enough blob gas left for transaction", "left", left, "needed", blobGas)
+			continue
+		}
+
+		err := miner.commitBundle(env, txs)
+		if err != nil {
+			log.Info("Failed to commit bundle", "err", err)
+		}
+	}
+	return nil
 }
 
 func (miner *Miner) commitTransactions(env *environment, plainTxs, blobTxs *transactionsByPriceAndNonce, interrupt *atomic.Int32) error {
@@ -391,6 +480,8 @@ func (miner *Miner) fillTransactions(interrupt *atomic.Int32, env *environment) 
 	if env.header.ExcessBlobGas != nil {
 		filter.BlobFee = uint256.MustFromBig(eip4844.CalcBlobFee(*env.header.ExcessBlobGas))
 	}
+
+	bundles := miner.txpool.PendingBundles(filter)
 	filter.OnlyPlainTxs, filter.OnlyBlobTxs = true, false
 	pendingPlainTxs := miner.txpool.Pending(filter)
 
@@ -411,6 +502,11 @@ func (miner *Miner) fillTransactions(interrupt *atomic.Int32, env *environment) 
 			localBlobTxs[account] = txs
 		}
 	}
+
+	if err := miner.commitBundleTxs(env, bundles, interrupt); err != nil {
+		return err
+	}
+
 	// Fill the block with all available pending transactions.
 	if len(localPlainTxs) > 0 || len(localBlobTxs) > 0 {
 		plainTxs := newTransactionsByPriceAndNonce(env.signer, localPlainTxs, env.header.BaseFee)
@@ -423,7 +519,6 @@ func (miner *Miner) fillTransactions(interrupt *atomic.Int32, env *environment) 
 	if len(remotePlainTxs) > 0 || len(remoteBlobTxs) > 0 {
 		plainTxs := newTransactionsByPriceAndNonce(env.signer, remotePlainTxs, env.header.BaseFee)
 		blobTxs := newTransactionsByPriceAndNonce(env.signer, remoteBlobTxs, env.header.BaseFee)
-
 		if err := miner.commitTransactions(env, plainTxs, blobTxs, interrupt); err != nil {
 			return err
 		}

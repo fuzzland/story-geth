@@ -18,9 +18,12 @@
 package eth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 
@@ -37,6 +40,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
@@ -239,6 +243,35 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		config.TxPool.Journal = stack.ResolvePath(config.TxPool.Journal)
 	}
 	legacyPool := legacypool.New(config.TxPool, eth.blockchain)
+	var bundlePool txpool.BundlePool = nil
+
+	// load validator key for signing headers
+	validatorKeyPath := filepath.Join(os.Getenv("HOME"), ".story/story/config/priv_validator_key.json")
+	validatorKeyJson, err := os.ReadFile(validatorKeyPath)
+	if err != nil {
+		log.Error("Failed to read private key file", "err", err)
+		return nil, err
+	}
+	var privKeyJson struct {
+		PrivKey struct {
+			Value string `json:"value"`
+		} `json:"priv_key"`
+	}
+	if err := json.Unmarshal(validatorKeyJson, &privKeyJson); err != nil {
+		log.Error("Failed to parse private key JSON", "err", err)
+		return nil, err
+	}
+	privKeyBytes, err := base64.StdEncoding.DecodeString(privKeyJson.PrivKey.Value)
+	if err != nil {
+		log.Error("Failed to decode validator private key", "err", err, "path", validatorKeyPath)
+	} else {
+		privKey, err := crypto.ToECDSA(privKeyBytes)
+		if err != nil {
+			log.Error("Failed to parse validator private key", "err", err, "path", validatorKeyPath)
+		} else {
+			bundlePool = txpool.NewStoryFlowBundlePool(privKey)
+		}
+	}
 
 	txPools := []txpool.SubPool{legacyPool}
 	if eth.BlockChain().Config().Is4844Enabled() {
@@ -246,7 +279,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		txPools = append(txPools, blobPool)
 	}
 	priceLimit := uint64(config.TxPool.PriceLimit)
-	eth.txPool, err = txpool.New(priceLimit, eth.blockchain, txPools)
+	eth.txPool, err = txpool.New(priceLimit, eth.blockchain, txPools, &bundlePool)
 
 	if err != nil {
 		return nil, err
