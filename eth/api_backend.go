@@ -19,6 +19,7 @@ package eth
 import (
 	"context"
 	"errors"
+	"github.com/ethereum/go-ethereum/bundle"
 	"math/big"
 	"time"
 
@@ -48,6 +49,11 @@ type EthAPIBackend struct {
 	allowUnprotectedTxs bool
 	eth                 *Ethereum
 	gpo                 *gasprice.Oracle
+	bundleService       *bundle.Service
+}
+
+func (b *EthAPIBackend) BundleService() *bundle.Service {
+	return b.bundleService
 }
 
 // ChainConfig returns the active chain configuration.

@@ -67,6 +67,16 @@ type Config struct {
 	// Configuration of peer-to-peer networking.
 	P2P p2p.Config
 
+	// RelayServer configuration for the bundle relay service
+	RelayServer struct {
+		// Host is the host interface on which to start the relay server. If empty,
+		// the relay server will not be started.
+		Host string `toml:",omitempty"`
+
+		// Port is the TCP port number on which to start the relay server.
+		Port int `toml:",omitempty"`
+	} `toml:",omitempty"`
+
 	// KeyStoreDir is the file system folder that contains private keys. The directory can
 	// be specified as a relative path, in which case it is resolved relative to the
 	// current directory.
